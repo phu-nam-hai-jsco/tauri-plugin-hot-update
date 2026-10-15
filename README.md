@@ -1,5 +1,7 @@
 # tauri-plugin-hot-update
 
+[English](README.md) | [Tiếng Việt](README.vi.md)
+
 [![crates.io](https://img.shields.io/crates/v/tauri-plugin-hot-update.svg)](https://crates.io/crates/tauri-plugin-hot-update)
 [![npm](https://img.shields.io/npm/v/tauri-plugin-hot-update-api.svg)](https://www.npmjs.com/package/tauri-plugin-hot-update-api)
 [![docs.rs](https://img.shields.io/docsrs/tauri-plugin-hot-update)](https://docs.rs/tauri-plugin-hot-update)

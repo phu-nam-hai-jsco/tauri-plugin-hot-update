@@ -1,3 +1,33 @@
+//! Máy trạng thái khôi phục (rollback state machine), viết bằng Rust thuần túy.
+//!
+//! Mỗi bước chuyển đổi nhận [`State`] hiện tại cùng một sự kiện và trả về trạng
+//! thái mới cùng với các [`Effect`] để vỏ I/O ([`crate::store`], [`crate::runtime`])
+//! thực thi. **Không có I/O nào diễn ra ở đây** — điều này giúp mọi kịch bản
+//! chống treo/hỏng (anti-brick) đều có thể kiểm thử đơn vị được.
+//!
+//! Con trỏ ba trạng thái (tài liệu thiết kế, "State machine"):
+//!
+//! ```text
+//! download ──▶ staged ──(khởi động nguội tiếp theo, lưu TRƯỚC KHI phục vụ)──▶ booting
+//!                            booting ──(xác nhận notifyAppReady)──────▶ committed
+//!                            booting ──(lần khởi động 1, không xác nhận)──▶ booting (tái kích hoạt)
+//!                            booting ──(lần khởi động 2, không xác nhận)──▶ failed (theo sha256 gói nén)
+//! ```
+//!
+//! Các bất biến được thực thi tại đây:
+//! - Việc thiếu xác nhận (ack) **chính là** tín hiệu thất bại (không dùng bộ đếm thời gian khởi động):
+//!   con trỏ `booting` được tìm thấy lúc khởi động đồng nghĩa với việc lần khởi chạy trước không bao giờ gửi ack.
+//!   Khởi chạy trên desktop thường ít và phiên dùng kéo dài, nên một lần bỏ lỡ duy nhất chỉ *tái kích hoạt*
+//!   cùng gói đó cho một lần thử nữa; lần khởi chạy thứ hai liên tiếp không có ack sẽ đưa mã sha256 gói nén
+//!   vào danh sách đen và việc phục vụ quay về committed/embedded. Một gói mà frontend nhúng mới hơn đã đuổi kịp
+//!   sẽ bị loại bỏ ngay (không đưa vào danh sách đen) — frontend nhúng sẽ được ưu tiên.
+//! - `max_version_seen` là một mốc chuẩn đơn điệu tăng (bảo vệ chống hạ cấp-phát lại và frontend nhúng mới hơn OTA).
+//!   Nó chỉ có thể tăng lên.
+//! - Các mã băm gói nén thất bại sẽ không bao giờ được chuyển vào staged hoặc kích hoạt lại.
+//! - Lệnh ack sẽ commit seq mà tiến trình thực sự đã khởi động (được truyền vào bởi bên gọi từ bộ nhớ),
+//!   không bao giờ đọc lại giá trị từ đĩa — một tiến trình tải xuống hoàn tất giữa phiên không được phép commit khi chưa thử nghiệm.
+//!
+//! ---
 //! The rollback state machine, as pure Rust.
 //!
 //! Every transition takes the current [`State`] plus an event and returns the
@@ -34,6 +64,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use semver::Version;
 use serde::{Deserialize, Serialize};
 
+/// Siêu dữ liệu theo từng gói được ghi nhận tại thời điểm chuyển vào staged.
+///
+/// `archive_sha256` là định danh dùng cho danh sách đen thất bại: một bản
+/// triển khai sửa lỗi sẽ mang mã băm mới, vì vậy việc đưa vào danh sách đen
+/// theo mã băm không bao giờ chặn bản vá.
+///
+/// ---
 /// Per-bundle metadata recorded at staging time.
 ///
 /// `archive_sha256` is the identity used for the failure blacklist: a fixed
@@ -45,6 +82,13 @@ pub struct BundleMeta {
     pub archive_sha256: String,
 }
 
+/// Nội dung được lưu trữ bền vững của `state.json`.
+///
+/// Được tuần tự hóa dưới dạng camelCase theo tài liệu thiết kế. Các trường không xác định
+/// từ các phiên bản plugin mới hơn sẽ bị bỏ qua khi đọc (tương thích tiến); một tệp
+/// hoàn toàn không thể phân tích cú pháp sẽ được store xem như mới tinh (không bao giờ hoảng loạn/panic).
+///
+/// ---
 /// The persisted contents of `state.json`.
 ///
 /// Serialized as camelCase per the design doc. Unknown fields from newer
@@ -53,16 +97,34 @@ pub struct BundleMeta {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct State {
+    /// Gói cuối cùng đã hoàn tất khởi động thử nghiệm và được xác nhận (acked).
+    ///
     /// The last bundle that completed a trial boot and was acked.
     pub committed: Option<u64>,
+    /// Gói tốt gần nhất đã biết. Di chuyển cùng với `committed` trong v1; được giữ
+    /// lại dưới dạng con trỏ riêng biệt theo thiết kế cho các luồng phục hồi trong tương lai.
+    ///
     /// Last-known-good bundle. Moves together with `committed` in v1; kept
     /// as a separate pointer per the design for future recovery flows.
     pub last_good: Option<u64>,
+    /// Đã tải xuống và giải nén, đang chờ lần khởi động nguội tiếp theo.
+    ///
     /// Downloaded and extracted, waiting for the next cold boot.
     pub staged: Option<u64>,
+    /// Được trang bị cho lần khởi động thử nghiệm. Xuất hiện lúc khởi động ⇒ lần thử trước
+    /// chưa từng được ack.
+    ///
     /// Armed for a trial boot. Present at boot time ⇒ the previous trial
     /// never acked.
     pub booting: Option<u64>,
+    /// Số lần khởi chạy không có ack liên tiếp của gói `booting` hiện tại. Khởi chạy trên
+    /// desktop thường ít và phiên kéo dài, do đó một gói *tốt* mà tiến trình bị thoát trước
+    /// khi gọi `notifyAppReady()` không được phép bị đưa vào danh sách đen chỉ sau một lần
+    /// lỡ: gói được tái trang bị một lần (strike 1) và chỉ bị đưa vào danh sách đen sau
+    /// lần khởi chạy thứ hai liên tiếp không có ack (strike 2). Được đặt lại về 0 khi commit
+    /// và bất cứ khi nào một gói mới được thăng cấp từ `staged`. `#[serde(default)]` để tệp
+    /// `state.json` cũ (thiếu trường này) tải lên với giá trị 0.
+    ///
     /// Consecutive unacked launches of the current `booting` bundle. Desktop
     /// launches are rare and sessions long, so a *good* bundle whose process
     /// quit before `notifyAppReady()` must not be blacklisted on a single
@@ -72,16 +134,26 @@ pub struct State {
     /// so a pre-2-strike `state.json` (which lacks the field) loads as 0.
     #[serde(default)]
     pub booting_strikes: u32,
+    /// Danh sách đen các mã băm sha256 của gói nén đã thất bại trong lần khởi động thử.
+    ///
     /// Blacklist of archive sha256 hashes that failed a trial boot.
     pub failed: BTreeSet<String>,
+    /// Mốc chuẩn đơn điệu: max(phiên bản nhúng, phiên bản OTA cao nhất đã commit).
+    /// Các manifest/gói bằng hoặc thấp hơn mốc này sẽ bị từ chối.
+    ///
     /// Monotonic watermark: max(embedded version, highest committed OTA
     /// version). Manifests/bundles at or below it are refused.
     pub max_version_seen: Option<Version>,
+    /// seq → siêu dữ liệu cho mọi gói mà trạng thái vẫn tham chiếu đến.
+    ///
     /// seq → metadata for every bundle the state still references.
     pub versions: BTreeMap<u64, BundleMeta>,
 }
 
 impl State {
+    /// Các seq mà trạng thái vẫn tham chiếu sau quá trình chuyển đổi — mọi thứ khác
+    /// trên đĩa đều là rác.
+    ///
     /// Seqs the state still references after a transition — everything else
     /// on disk is garbage.
     fn referenced(&self) -> BTreeSet<u64> {
@@ -92,6 +164,8 @@ impl State {
     }
 }
 
+/// Nguồn mà provider phục vụ trong suốt vòng đời tiến trình này.
+///
 /// Which source the provider serves this process lifetime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Active {
@@ -99,6 +173,11 @@ pub enum Active {
     Ota(u64),
 }
 
+/// Các hiệu ứng phụ (side effects) để shell thực thi sau khi lưu trạng thái mới.
+/// Việc xóa file theo nguyên tắc nỗ lực tối đa (best-effort): nếu lỗi sẽ để lại
+/// thư mục mồ côi mà bộ thu gom rác (GC) ở lần khởi động tiếp theo sẽ dọn dẹp.
+///
+/// ---
 /// Side effects for the shell to execute after persisting the new state.
 /// Deletions are best-effort: a failure leaves an orphan dir that the next
 /// boot's GC removes.
@@ -107,19 +186,34 @@ pub enum Effect {
     DeleteBundle(u64),
 }
 
+/// Kết quả phân giải tại thời điểm khởi động.
+///
 /// Result of boot-time resolution.
 #[derive(Debug)]
 pub struct BootOutcome {
     pub state: State,
+    /// Dữ liệu mà tiến trình này phải phục vụ. Shell phải lưu `state` TRƯỚC KHI
+    /// phục vụ dù chỉ một byte khi đây là một gói mới được trang bị
+    /// (`state.booting`), nếu không một vụ crash sẽ lọt qua khỏi cơ chế phát hiện rollback.
+    ///
     /// What this process must serve. The shell must persist `state` BEFORE
     /// serving a single byte when this is a newly armed bundle
     /// (`state.booting`), otherwise a crash would evade rollback detection.
     pub active: Active,
+    /// Seq bị quy trách nhiệm cho lần khởi động thử nghiệm không có ack trước đó, nếu có.
+    ///
     /// Seq blamed for the previous unacked trial boot, if any.
     pub rolled_back: Option<u64>,
     pub effects: Vec<Effect>,
 }
 
+/// Phân giải lúc khởi động: phát hiện rollback, tích hợp mốc chuẩn watermark,
+/// loại bỏ gói khi frontend nhúng mới hơn OTA, thăng cấp staged→booting, thu gom rác (GC).
+///
+/// `present` là tập hợp các thư mục gói thực sự tồn tại trên đĩa; các con trỏ
+/// trỏ tới thư mục vắng mặt sẽ bị hủy bỏ thay vì được trang bị/phục vụ.
+///
+/// ---
 /// Boot-time resolution: rollback detection, watermark fold-in,
 /// embedded-newer-than-OTA discard, staged→booting promotion, GC.
 ///
@@ -254,21 +348,40 @@ pub fn resolve_boot(
     }
 }
 
+/// Kết quả của một lệnh xác nhận ([`ack`]).
+///
 /// Result of an ack ([`ack`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AckOutcome {
+    /// Gói thử nghiệm hiện đã được commit và là gói tốt gần nhất.
+    ///
     /// The trial bundle is now committed and last-good.
     Committed(u64),
+    /// Trạng thái ổn định: gói đã khởi động vốn đã được commit (mọi lần khởi chạy
+    /// đều gọi `notifyAppReady`, và lệnh gọi này có tính lũy đẳng).
+    ///
     /// Steady state: the booted bundle was already committed (every launch
     /// calls `notifyAppReady`, and the call is idempotent).
     AlreadyCommitted(u64),
+    /// Đang phục vụ gói nhúng — không có gì để commit.
+    ///
     /// Serving embedded — nothing to commit.
     EmbeddedNoop,
+    /// Seq đã khởi động không còn khớp với con trỏ `booting` trên đĩa (ví dụ:
+    /// một lệnh `reset()` đã chạy giữa phiên). Từ chối commit là giải pháp an toàn.
+    ///
     /// The booted seq no longer matches the on-disk `booting` pointer (e.g.
     /// a `reset()` ran mid-session). Refusing to commit is the safe answer.
     Stale(u64),
 }
 
+/// `notifyAppReady`: commit gói mà tiến trình này đã khởi động.
+///
+/// `booted` BẮT BUỘC phải là giá trị trong bộ nhớ được ghi lại khi phân giải khởi động — không bao giờ
+/// đọc lại từ đĩa, vì việc tải xuống hoàn tất giữa phiên có thể đã
+/// ghi đè lại `staged` (và `staged` phải được giữ nguyên vẹn cho lần khởi động tiếp theo).
+///
+/// ---
 /// `notifyAppReady`: commit the bundle this process booted.
 ///
 /// `booted` MUST be the in-memory value captured at boot resolution — never
@@ -314,6 +427,8 @@ pub fn ack(mut state: State, booted: Active) -> (State, AckOutcome, Vec<Effect>)
     (state, AckOutcome::Committed(seq), effects)
 }
 
+/// Lý do tại sao yêu cầu đưa vào staged bị từ chối.
+///
 /// Why a staging request was refused.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum StageError {
@@ -328,6 +443,13 @@ pub enum StageError {
     SeqInUse(u64),
 }
 
+/// Đưa gói vừa được giải nén vào staged (bước cuối cùng của bộ tải xuống WP3).
+///
+/// Điều kiện kiểm soát: phiên bản phải cao hơn hẳn so với mốc watermark (bảo vệ
+/// chống hạ cấp-phát lại) và mã băm gói nén không nằm trong danh sách đen. Việc thay thế
+/// một gói đã staged trước đó nhưng chưa từng được trang bị sẽ biến nó thành mồ côi (hiệu ứng xóa).
+///
+/// ---
 /// Stage a freshly extracted bundle (the WP3 downloader's final step).
 ///
 /// Gates: the version must be strictly above the watermark (downgrade-replay
@@ -364,6 +486,14 @@ pub fn stage(
     (state, Ok(effects))
 }
 
+/// `reset()`: lối thoát khẩn cấp để debug/hỗ trợ — trạng thái xuất xưởng, phục vụ
+/// gói nhúng, mốc watermark được khởi động lại từ phiên bản nhúng.
+///
+/// Gói mà tiến trình *hiện đang phục vụ* (nếu có) được chủ động giữ lại không
+/// xóa — việc giật mất tệp ngay dưới webview đang chạy có thể làm hỏng giao diện
+/// người dùng. Nó không còn được trạng thái mới tham chiếu, nên GC của lần khởi động tới sẽ dọn dẹp nó.
+///
+/// ---
 /// `reset()`: the debug/support escape hatch — factory state, embedded
 /// serving, watermark restarted from the embedded version.
 ///

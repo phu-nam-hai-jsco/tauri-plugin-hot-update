@@ -1,3 +1,16 @@
+//! Phía phát hành ký bản cập nhật: đóng gói lưu trữ bundle, tạo manifest, ký
+//! xác thực. Đây là mã nguồn đằng sau CLI `hot-update-sign` (tính năng `cli`) và
+//! nó cũng được chủ động biên dịch dưới `cfg(test)`, giúp bộ kiểm thử
+//! chạy khép kín mã ký *thực tế* đối chiếu với luồng xác minh bằng các khóa
+//! thật — không bao giờ là bản tái hiện giả lập.
+//!
+//! Quá trình đóng gói lưu trữ có tính tất định (các mục được sắp xếp, mtime/owner được đưa về 0,
+//! phân quyền cố định): ký lại một dist giống hệt sẽ tạo ra một gói lưu trữ giống hệt
+//! và do đó sinh ra mã sha256 y hệt. Chỉ có các tệp tin được đóng gói — quá trình giải nén
+//! sẽ tái tạo lại các thư mục cha — và các liên kết mềm (symlink) trong dist sẽ được lần theo
+//! trên máy của bên phát hành, chuyển thành nội dung tệp thông thường.
+//!
+//! ---
 //! Release-side signing: build the bundle archive, write the manifest, sign
 //! it. This is the code behind the `hot-update-sign` CLI (feature `cli`) and
 //! it is deliberately compiled under `cfg(test)` too, so the test suite
@@ -20,22 +33,37 @@ use sha2::{Digest, Sha256};
 use crate::download::to_hex;
 use crate::manifest::{ArchiveInfo, Manifest};
 
+/// Những gì cần ký và nơi lưu trữ kết quả.
+///
 /// What to sign and where to put it.
 #[derive(Debug)]
 pub struct SignOptions<'a> {
+    /// Thư mục phân phối dist của frontend đã được build (thư mục gốc của gói lưu trữ = thư mục này).
+    ///
     /// The built frontend dist directory (archive root = this directory).
     pub dist_dir: &'a Path,
+    /// Phiên bản của gói bundle (phải lớn hơn mốc watermark đã cài đặt mới được áp dụng).
+    ///
     /// Bundle version (must exceed installed watermarks to be applied).
     pub version: Version,
+    /// Phiên bản shell (ứng dụng) tối thiểu có thể chạy gói này.
+    ///
     /// Minimum shell (app) version able to run this bundle.
     pub min_shell_version: Version,
+    /// URL cơ sở công khai nơi gói lưu trữ sẽ được phục vụ; `archive.url` của manifest
+    /// sẽ trở thành `{base_url}/{archive file name}`.
+    ///
     /// Public base URL the archive will be served from; the manifest's
     /// `archive.url` becomes `{base_url}/{archive file name}`.
     pub base_url: &'a str,
+    /// Thư mục đầu ra cho ba thành phần cấu thành (tự động tạo nếu chưa có).
+    ///
     /// Output directory for the three artifacts (created if missing).
     pub out_dir: &'a Path,
 }
 
+/// Ba thành phần cấu thành cần tải lên, cùng với manifest đã được ký.
+///
 /// The three artifacts to upload, plus the manifest that was signed.
 #[derive(Debug)]
 pub struct SignedRelease {
@@ -55,6 +83,14 @@ pub enum SignError {
     Minisign(#[from] minisign::PError),
 }
 
+/// Tạo ra `bundle-<version>.tar.gz`, `manifest.json`, và
+/// `manifest.json.minisig` trong `out_dir`.
+///
+/// Chữ ký được tính toán trên chính xác các byte của manifest được ghi vào đĩa;
+/// manifest nhúng kích thước và mã sha256 thực tế của gói lưu trữ. Khóa bí mật
+/// phải được giải mã sẵn ([`minisign::SecretKey::from_file`] xử lý mật khẩu).
+///
+/// ---
 /// Produce `bundle-<version>.tar.gz`, `manifest.json`, and
 /// `manifest.json.minisig` in `out_dir`.
 ///
@@ -106,6 +142,9 @@ pub fn sign_release(
     })
 }
 
+/// Tạo tệp tar.gz có tính tất định cho mọi tệp bên dưới `dist_dir` (đường dẫn
+/// tương đối đã sắp xếp, mode 0644, uid/gid 0, mtime 0).
+///
 /// Deterministic tar.gz of every file under `dist_dir` (sorted relative
 /// paths, mode 0644, uid/gid 0, mtime 0).
 fn build_archive(dist_dir: &Path, archive_path: &Path) -> Result<(), SignError> {
@@ -132,6 +171,8 @@ fn build_archive(dist_dir: &Path, archive_path: &Path) -> Result<(), SignError> 
     Ok(())
 }
 
+/// Đường dẫn tương đối của tất cả các tệp bên dưới `dir`, theo đệ quy; lần theo các symlink.
+///
 /// Relative paths of all files under `dir`, recursively; symlinks followed.
 fn collect_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> io::Result<()> {
     for entry in fs::read_dir(dir)? {
@@ -149,6 +190,8 @@ fn collect_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> io::Result<
     Ok(())
 }
 
+/// Mốc thời gian UTC theo chuẩn RFC 3339 dùng cho trường thông tin `createdAt` của manifest.
+///
 /// RFC 3339 UTC timestamp for the manifest's informational `createdAt`.
 fn created_at_now() -> String {
     time::OffsetDateTime::now_utc()

@@ -1,3 +1,15 @@
+//! Tệp kê khai cập nhật có chữ ký số: lược đồ, xác thực chữ ký, kiểm tra tính hợp lệ.
+//!
+//! Thứ tự xác thực là cố định và mang tính cốt lõi về bảo mật (tài liệu thiết kế, mục "Manifest
+//! and signing"): chữ ký minisign được xác thực trên **chuỗi byte thô của manifest trước tiên**,
+//! đối chiếu với DANH SÁCH khóa tin cậy nhúng sẵn (bất kỳ khóa nào xác thực thành công đều được chấp nhận —
+//! đó chính là cơ chế luân chuyển khóa: một bản phát hành qua kho ứng dụng bổ sung khóa mới, cả hai khóa
+//! đều có thể ký trong giai đoạn chuyển đổi, khóa cũ sẽ bị loại bỏ sau này). Chỉ sau đó các byte mới được
+//! phân tích cú pháp thành JSON và kiểm tra tính hợp lệ. Không có bất kỳ đoạn mã xử lý nào phía sau tiếp xúc
+//! với dữ liệu chưa được xác minh.
+//!
+//! ---
+//!
 //! The signed update manifest: schema, signature verification, validation.
 //!
 //! Verification order is fixed and security-relevant (design doc, "Manifest
@@ -14,6 +26,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Error, Result};
 
+/// Tệp kê khai cập nhật (manifest), chính xác như nội dung được phát hành bên cạnh
+/// chữ ký tách rời `.minisig`.
+///
+/// Các trường không xác định được chủ ý chấp nhận (không dùng `deny_unknown_fields`):
+/// các trường mới bổ sung vào lược đồ manifest sau này không được làm hỏng các phiên bản shell cũ —
+/// chữ ký đã bảo đảm tính toàn vẹn và đáng tin cậy của toàn bộ tài liệu.
+///
+/// ---
+///
 /// The update manifest, exactly as published next to its detached
 /// `.minisig` signature.
 ///
@@ -23,28 +44,50 @@ use crate::{Error, Result};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Manifest {
-    /// Bundle version; must be strictly newer than the shell's watermark.
+    /// Phiên bản gói bundle; phải lớn hơn nghiêm ngặt so với con dấu phiên bản của shell.
+    /// / Bundle version; must be strictly newer than the shell's watermark.
     pub version: Version,
+    /// Dấu thời gian phát hành để thông tin (RFC 3339). Không được dùng trong bất kỳ điều kiện cổng nào —
+    /// thứ tự phiên bản mới là yếu tố quyết định — do đó được giữ như một chuỗi mờ (opaque string).
+    ///
     /// Informational publish timestamp (RFC 3339). Not used in any gate —
     /// version ordering is what matters — so it stays an opaque string.
     pub created_at: String,
-    /// Minimum shell (app) version able to run this bundle.
+    /// Phiên bản shell (app) tối thiểu có khả năng chạy gói bundle này.
+    /// / Minimum shell (app) version able to run this bundle.
     pub min_shell_version: Version,
     pub archive: ArchiveInfo,
 }
 
+/// Nơi lưu trữ tệp nén bundle và mã băm tương ứng mà nó phải khớp.
+///
+/// ---
+///
 /// Where the bundle archive lives and what it must hash to.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ArchiveInfo {
     pub url: String,
+    /// Mã băm hex sha256 của các byte tệp nén. Được chuẩn hóa về chữ thường lúc phân tích
+    /// để dùng làm định danh danh sách đen trong `state.json`.
+    ///
     /// Hex sha256 of the archive bytes. Canonicalized to lowercase at parse
     /// time so it can serve as the blacklist identity in `state.json`.
     pub sha256: String,
-    /// Exact archive byte count; the download aborts past it.
+    /// Kích thước byte chính xác của tệp nén; quá trình tải xuống sẽ dừng nếu vượt quá.
+    /// / Exact archive byte count; the download aborts past it.
     pub size: u64,
 }
 
+/// Xác thực `signature` (nội dung tệp `.minisig`) trên chuỗi byte thô `manifest_bytes`
+/// đối chiếu với danh sách khóa tin cậy, sau đó phân tích cú pháp và kiểm tra hợp lệ.
+///
+/// Bất kỳ một khóa tin cậy đơn lẻ nào xác thực thành công là đủ (luân chuyển khóa). Một khóa bị sai
+/// định dạng ở bất kỳ đâu trong danh sách đều báo lỗi nghiêm ngặt [`Error::InvalidPublicKey`] — một mỏ neo
+/// tin cậy bị hỏng là lỗi cấu hình cần phải xuất hiện ngay, không được bỏ qua.
+///
+/// ---
+///
 /// Verify `signature` (the `.minisig` file contents) over the raw
 /// `manifest_bytes` against the trusted key list, then parse and validate.
 ///
@@ -82,6 +125,12 @@ pub fn verify_and_parse(
     Ok(manifest)
 }
 
+/// Kiểm tra lúc khởi tạo rằng mọi mỏ neo tin cậy đã cấu hình đều phân tích cú pháp được thành
+/// tài liệu khóa minisign ([`verify_and_parse`] sẽ phân tích lại khi sử dụng). Cùng quy tắc dừng ngay:
+/// một khóa sai định dạng sẽ đánh trượt toàn bộ danh sách.
+///
+/// ---
+///
 /// Init-time check that every configured trust anchor parses as minisign
 /// key material ([`verify_and_parse`] re-parses at use). Same hard-stop rule
 /// as verification: one malformed key fails the whole list.

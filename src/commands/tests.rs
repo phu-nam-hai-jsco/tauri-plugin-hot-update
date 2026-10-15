@@ -1,3 +1,14 @@
+//! Các bài kiểm thử tầng lệnh (Command-layer tests): toàn bộ plugin (cài đặt assets + khởi tạo + IPC) trên
+//! `tauri::test::MockRuntime`, với các lệnh được gọi qua tuyến IPC thực tế (ACL, phân tích đối số, phản hồi serde)
+//! trên kho lưu trữ thực tế trên đĩa — cùng với các bài kiểm thử mẫu chuẩn (golden tests) ghim chặt từng cấu trúc
+//! JSON mà gói TypeScript (`guest-js/`) tái tạo. Việc đổi tên một trường Rust bắt buộc phải báo lỗi tại đây
+//! trước khi nó có thể phá vỡ hợp đồng giao tiếp liên ngôn ngữ.
+//!
+//! Mỗi lượt gọi `build_app` là một "lần khởi động nguội (cold launch)": một đối tượng `Shared` mới tinh (tiến trình mới)
+//! trên thư mục gốc kho lưu trữ bền vững, hoàn toàn giống với các bài kiểm thử runtime.
+//!
+//! ---
+//!
 //! Command-layer tests: the full plugin (assets install + init + IPC) on
 //! `tauri::test::MockRuntime`, with commands invoked through the real IPC
 //! route (ACL, argument parsing, serde response) against a real on-disk
@@ -31,6 +42,11 @@ fn ver(s: &str) -> Version {
     Version::parse(s).unwrap()
 }
 
+/// Một lần khởi động nguội: toàn bộ plugin (install + init) trên `root`, với toàn bộ năm
+/// lệnh được cấp quyền cho origin cục bộ. `plugin_config` là giá trị thô `plugins.hot-update` từ tauri.conf.json.
+///
+/// ---
+///
 /// One cold launch: full plugin (install + init) over `root`, with all five
 /// commands allowed for the local origin. `plugin_config` is the raw
 /// `plugins.hot-update` value from tauri.conf.json.

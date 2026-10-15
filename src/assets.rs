@@ -1,3 +1,20 @@
+//! Nhà cung cấp `Assets`: ưu tiên thư mục gói OTA đang hoạt động trước, dự phòng bằng gói nhúng.
+//!
+//! Đây là điểm gọi đơn nhất đằng sau trình xử lý scheme `tauri://` trên mọi
+//! nền tảng, do đó nguồn gốc (origin) không bao giờ thay đổi và bộ lưu trữ web (trạng thái auth/session)
+//! được bảo toàn theo đúng thiết kế. Cơ chế dự phòng tuyến đường SPA (`/foo` →
+//! `/foo/index.html` → `/index.html`) nằm trong `get_asset` của tauri,
+//! nơi sẽ thử lại `get()` theo từng ứng viên — nhà cung cấp chỉ phản hồi cho các khóa chính xác.
+//!
+//! Quy tắc CSP (tài liệu thiết kế, chốt ngày 2026-07-09): `csp_hashes()` được liên kết với
+//! nguồn hoạt động *theo từng khóa*. Khi một khóa được phục vụ từ gói OTA thì
+//! các mã băm lúc biên dịch (tính từ HTML nhúng) sẽ bị cũ, do đó
+//! một iterator rỗng được trả về — giữ nguyên cấu hình `'unsafe-inline'`
+//! hoạt động, giống hệt như một bản triển khai web thông thường. Khi một khóa quay về
+//! tài nguyên nhúng dự phòng, các mã băm nhúng sẽ được ủy quyền sử dụng. Không bao giờ dùng mã băm cũ
+//! cho nội dung mới.
+//!
+//! ---
 //! The `Assets` provider: active-OTA-bundle-dir first, embedded fallback.
 //!
 //! This is the single call site behind the `tauri://` scheme handler on every
@@ -23,6 +40,9 @@ use tauri::{App, Assets, Runtime};
 
 use crate::runtime::Shared;
 
+/// Nhà cung cấp Assets bao bọc `EmbeddedAssets` nhúng lấy từ
+/// `Context` được sinh ra (thông qua `Context::set_assets` chính thức).
+///
 /// Assets provider wrapping the embedded `EmbeddedAssets` taken from the
 /// generated `Context` (via the official `Context::set_assets`).
 pub struct HotUpdateAssets<R: Runtime> {
@@ -110,6 +130,13 @@ impl<R: Runtime> Assets<R> for PlaceholderAssets {
     }
 }
 
+/// Nối một asset key đã chuẩn hóa vào thư mục gói, từ chối bất kỳ điều gì
+/// có thể thoát ra khỏi thư mục đó. `AssetKey` vốn đã được tauri chuẩn hóa (bắt đầu từ gốc, dấu phân cách unix),
+/// nhưng đây là tầng phục vụ — cần nghiêm ngặt bất kể: mọi thành phần
+/// phải là tên thông thường (không có `..`, không có `.`, không có thành phần gốc/tiền tố
+/// như ký tự ổ đĩa Windows).
+///
+/// ---
 /// Join a normalized asset key onto the bundle dir, refusing anything that
 /// could escape it. `AssetKey` is already normalized by tauri (rooted, unix
 /// separators), but this is the serving layer — be strict regardless: every

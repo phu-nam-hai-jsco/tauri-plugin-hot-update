@@ -1,3 +1,11 @@
+//! Các trợ giúp chỉ dùng cho kiểm thử được chia sẻ giữa các bài test update và command: một máy chủ
+//! HTTP cục bộ cùng với fixture bản phát hành đã ký. Socket thật, chữ ký thật — không dùng
+//! mock cho phần mã đang được kiểm thử. Máy chủ được viết thủ công trên nền `TcpListener`
+//! (thay vì dùng thư viện máy chủ bên ngoài) vì các bài test update cần quyền kiểm soát
+//! chính xác các hành vi truyền dữ liệu — đáng chú ý nhất là phản hồi khai báo Content-Length
+//! rồi đóng kết nối sớm (trường hợp tải dở dang), điều mà các thư viện máy chủ chuẩn từ chối thực hiện.
+//!
+//! ---
 //! Test-only helpers shared by the update and command tests: a local HTTP
 //! server plus a signed-release fixture. Real sockets, real signing — no
 //! mocks of the code under test. The server is hand-rolled over
@@ -22,6 +30,11 @@ use crate::sign::{sign_release, SignOptions};
 use crate::store::Store;
 use crate::update::UpdateConfig;
 
+/// Một bản phát hành đã ký có thể xuất bản: thư mục dist, một cặp khóa minisign được sinh ra,
+/// và một [`TestServer`] phục vụ bất cứ thứ gì [`Fixture::publish`] đã ký. `root`
+/// là thư mục gốc store mới (thư mục `hot-update/`) để chạy thử nghiệm khởi động.
+///
+/// ---
 /// A publishable signed release: a dist dir, a generated minisign keypair,
 /// and a [`TestServer`] serving whatever [`Fixture::publish`] signs. `root`
 /// is a fresh store root (the `hot-update/` dir) for booting against.
@@ -55,6 +68,9 @@ impl Fixture {
         }
     }
 
+    /// Ký thư mục dist bằng mã ký của CLI và phục vụ cả ba
+    /// tệp thành phần. Trả về manifest và đường dẫn máy chủ của gói nén.
+    ///
     /// Sign the dist with the CLI's signing code and serve the three
     /// artifacts. Returns the manifest and the archive's server path.
     pub fn publish(&self, version: &str, min_shell: &str) -> (Manifest, String) {
@@ -90,12 +106,19 @@ impl Fixture {
         serde_json::from_slice(&fs::read(self.root.join("state.json")).unwrap()).unwrap()
     }
 
+    /// Rác không phải `seq-N` dưới bundles/ (tệp/thư mục tạm bị rò rỉ).
+    ///
     /// Non-`seq-N` debris under bundles/ (leaked temp files/dirs).
     pub fn debris(&self) -> Vec<PathBuf> {
         Store::new(self.root.clone()).foreign_entries()
     }
 }
 
+/// Một đường dẫn có thể phục vụ. `declared_len` ghi đè tiêu đề Content-Length;
+/// một giá trị lớn hơn `body.len()` sẽ tạo ra phản hồi bị cắt cụt (đóng kết nối sớm
+/// theo góc nhìn của client).
+///
+/// ---
 /// One servable path. `declared_len` overrides the Content-Length header;
 /// a value larger than `body.len()` yields a truncated response (premature
 /// connection close from the client's point of view).
@@ -112,6 +135,9 @@ pub struct TestServer {
 }
 
 impl TestServer {
+    /// Bind vào 127.0.0.1 trên một cổng ngẫu nhiên và phục vụ trên luồng nền
+    /// trong suốt thời gian còn lại của tiến trình (các luồng test nhẹ và ở trạng thái nhàn rỗi).
+    ///
     /// Bind 127.0.0.1 on an ephemeral port and serve on a background thread
     /// for the rest of the process (test threads are cheap and idle).
     pub fn start() -> Self {
@@ -134,6 +160,8 @@ impl TestServer {
         }
     }
 
+    /// URL tuyệt đối cho một đường dẫn (`path` phải bắt đầu bằng `/`).
+    ///
     /// Absolute URL for a path (`path` must start with `/`).
     pub fn url(&self, path: &str) -> String {
         format!("{}{path}", self.base_url)
@@ -153,6 +181,8 @@ impl TestServer {
         self.routes.lock().unwrap().insert(path.to_string(), route);
     }
 
+    /// Mọi đường dẫn yêu cầu đã được phục vụ từ trước đến nay, theo thứ tự.
+    ///
     /// Every request path served so far, in order.
     pub fn requests(&self) -> Vec<String> {
         self.requests.lock().unwrap().clone()
@@ -163,6 +193,9 @@ impl TestServer {
     }
 }
 
+/// Phục vụ một kết nối: phân tích dòng GET, ghi log, phản hồi với route
+/// (hoặc 404), luôn luôn có `Connection: close`.
+///
 /// Serve one connection: parse the GET line, log it, answer with the route
 /// (or 404), always `Connection: close`.
 fn handle(

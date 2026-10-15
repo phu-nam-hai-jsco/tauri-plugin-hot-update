@@ -1,3 +1,56 @@
+//! Cập nhật nóng (Hot update) / Cập nhật trực tiếp qua mạng OTA cho ứng dụng di động và desktop chạy Tauri v2 —
+//! phong cách CodePush, tự lưu trữ (self-hosted).
+//!
+//! Phục vụ frontend từ một gói OTA đã tải về khi có bản cập nhật đang hoạt động,
+//! tự động dự phòng về tài nguyên nhúng được biên dịch từ `frontendDist`. Các bản cập nhật
+//! chỉ được áp dụng vào lần khởi động nguội (cold launch) tiếp theo, được bảo vệ bởi con trỏ
+//! hoàn tác ba trạng thái (`staged → booting → committed`): gói nào không bao giờ gửi xác nhận qua
+//! [`HotUpdate::notify_app_ready`] sẽ bị đưa vào danh sách đen theo mã băm tệp nén ở lần khởi động
+//! kế tiếp, và việc phục vụ tài nguyên sẽ quay về gói hoạt động tốt gần nhất hoặc tài nguyên nhúng.
+//! Một gói OTA lỗi không bao giờ có thể làm hỏng (brick) ứng dụng đã cài đặt.
+//!
+//! # Tích hợp (hai bước)
+//!
+//! Việc hoán đổi tài nguyên phải diễn ra trên `Context` trước khi `Builder::build`
+//! tiêu thụ nó, trong khi việc phân giải đường dẫn (thư mục dữ liệu ứng dụng) chỉ khả dụng
+//! khi ứng dụng đang được dựng — do đó chia làm hai bước dùng chung một handle:
+//!
+//! ```rust,ignore
+//! fn main() {
+//!     let mut context = tauri::generate_context!();
+//!     // 1. Hoán đổi tài nguyên nhúng sang nhà cung cấp hot-update.
+//!     let hot_update = tauri_plugin_hot_update::install(&mut context);
+//!     tauri::Builder::default()
+//!         // 2. Đăng ký plugin; setup hook của nó sẽ phân giải kho lưu trữ
+//!         //    bundle và kích hoạt/hoàn tác TRƯỚC KHI bất kỳ webview nào tồn tại.
+//!         .plugin(tauri_plugin_hot_update::init(hot_update))
+//!         .run(context)
+//!         .expect("error while running tauri application");
+//! }
+//! ```
+//!
+//! Cấu hình nằm trong `tauri.conf.json` (xem [`Config`]) và được xác thực bên trong
+//! setup hook — URL manifest hoặc khóa tin cậy bị sai định dạng sẽ dừng khởi động ngay
+//! trên máy lập trình viên, tuyệt đối không bị lỗi âm thầm khi ra môi trường thực tế.
+//! Năm lệnh IPC (`check`, `download`, `notify_app_ready`, `current_bundle`, `reset`;
+//! gói npm `tauri-plugin-hot-update-api`) phải được cấp quyền trong tệp capability, ví dụ:
+//! `"permissions": ["hot-update:default"]`.
+//!
+//! Hãy đăng ký plugin này trước các plugin khác để không thành phần nào truy cập tài nguyên
+//! sớm hơn bước phân giải khởi động. Frontend phải gọi `notifyAppReady()` sau khi khung
+//! ứng dụng (app shell) đã mount và render xong — chủ đích độc lập hoàn toàn với kết nối mạng
+//! hoặc xác thực, giúp sự cố backend không bao giờ làm hỏng hàng loạt gói bundle tốt trên toàn bộ thiết bị.
+//!
+//! # Bảo đảm thứ tự thực thi
+//!
+//! Các setup hook của plugin chạy bên trong `Builder::build` (tauri 2.10.2
+//! `app.rs:2289`), hoàn toàn diễn ra trước khi các cửa sổ và webview được tạo
+//! (`app.rs:2373`). Do đó, việc nâng trạng thái staged→booting được lưu bền vững xuống đĩa
+//! trước khi nhà cung cấp phục vụ dù chỉ một byte, trên mọi nền tảng — bao gồm cả
+//! Android, nơi thư mục dữ liệu ứng dụng không thể phân giải trước khi ứng dụng tồn tại.
+//!
+//! ---
+//!
 //! Hot update / OTA live updates for Tauri v2 mobile and desktop apps —
 //! CodePush-style, self-hosted.
 //!
@@ -65,6 +118,12 @@ mod extract;
 mod machine;
 mod manifest;
 mod runtime;
+/// Ký số phía phát hành (phần lõi của CLI `hot-update-sign`). Chỉ công khai khi bật
+/// feature `cli`; đồng thời được biên dịch cho các bài kiểm thử để bộ test đối soát
+/// toàn diện giữa mã ký thực tế và quy trình xác thực.
+///
+/// ---
+///
 /// Release-side signing (the `hot-update-sign` CLI's core). Public only with
 /// the `cli` feature; also compiled for tests so the suite round-trips the
 /// real signing code against the verify path.
@@ -87,12 +146,26 @@ pub use update::{UpdateConfig, UpdateOutcome};
 
 use runtime::Shared;
 
+/// Liên kết ẩn giữa [`install`] (tạo nhà cung cấp tài nguyên) và
+/// [`init`] (kích hoạt nhà cung cấp khi đường dẫn đã phân giải được).
+///
+/// ---
+///
 /// Opaque link between [`install`] (which creates the assets provider) and
 /// [`init`] (which activates it once paths are resolvable).
 pub struct HotUpdateHandle {
     shared: Arc<Shared>,
 }
 
+/// Bước 1: Hoán đổi tài nguyên nhúng của context sang nhà cung cấp hot-update.
+/// Phải được gọi trước khi `tauri::Builder::build`/`run` tiêu thụ context.
+/// Truyền handle trả về vào [`init`].
+///
+/// Cho đến khi setup hook của [`init`] chạy, nhà cung cấp sẽ phục vụ tài nguyên nhúng
+/// — chốt chặn an toàn dự phòng.
+///
+/// ---
+///
 /// Step 1: swap the generated context's embedded assets for the hot-update
 /// provider. Must be called before `tauri::Builder::build`/`run` consumes
 /// the context. Pass the returned handle to [`init`].
@@ -111,6 +184,17 @@ pub fn install<R: Runtime>(context: &mut tauri::Context<R>) -> HotUpdateHandle {
     HotUpdateHandle { shared }
 }
 
+/// Bước 2: Khởi tạo plugin. Setup hook của nó (được tauri chạy trước khi bất kỳ webview nào
+/// được tạo) xác thực [`Config`] từ `tauri.conf.json`, phân giải `{app_data_dir}/hot-update`,
+/// tải `state.json`, thực hiện hoàn tác/kích hoạt, lưu bền vững và bắt đầu phục vụ.
+///
+/// Cấu hình `plugins.hot-update` bị thiếu hoặc không hợp lệ sẽ dừng quá trình khởi động (cấu hình
+/// là cấu phần lúc build — đặt `{ "enabled": false }` nếu muốn tắt thử nghiệm).
+/// Các sự cố *khi đang chạy* (không phân giải được thư mục dữ liệu, không ghi được trạng thái)
+/// sẽ tự động hạ cấp về phục vụ tài nguyên nhúng; không bao giờ làm tắt ứng dụng.
+///
+/// ---
+///
 /// Step 2: the plugin. Its setup hook (which tauri runs before any webview
 /// is created) validates the [`Config`] from `tauri.conf.json`, resolves
 /// `{app_data_dir}/hot-update`, loads `state.json`, performs
@@ -124,6 +208,11 @@ pub fn init<R: Runtime>(handle: HotUpdateHandle) -> TauriPlugin<R, Option<Config
     init_with_root(handle, None)
 }
 
+/// Biến thể chỉ dùng trong kiểm thử, ghim thư mục gốc của kho lưu trữ vào thư mục tạm thay vì
+/// gọi `app_data_dir()` thực tế (trên mock runtime sẽ phân giải vào thư mục home người dùng thật).
+///
+/// ---
+///
 /// Test-only variant pinning the store root to a temp dir instead of the
 /// real `app_data_dir()` (which on a mock runtime resolves into the real
 /// user home).
@@ -186,6 +275,13 @@ fn init_with_root<R: Runtime>(
         .build()
 }
 
+/// Truy cập Runtime API [`HotUpdate`] từ bất kỳ `Manager` nào (app handle,
+/// window, webview).
+///
+/// Sẽ panic nếu plugin chưa được đăng ký qua [`init`].
+///
+/// ---
+///
 /// Access the [`HotUpdate`] runtime API from any `Manager` (app handle,
 /// window, webview).
 ///

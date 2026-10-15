@@ -1,3 +1,30 @@
+//! Quá trình giải nén tar.gz được gia cố an toàn cho các gói bundle tải về.
+//!
+//! Tệp nén được xem là do kẻ tấn công kiểm soát cho đến khi mã băm sha256 của nó khớp với
+//! manifest đã ký — và ngay cả khi đã khớp, cơ chế phòng thủ theo chiều sâu vẫn được áp dụng: bộ giải nén
+//! này giả định rằng tệp nén luôn có khả năng chứa mã độc hại. Các biện pháp gia cố:
+//!
+//! - **Liên kết mềm (Symlink) và liên kết cứng (hardlink) bị từ chối**, không chỉ đơn thuần là bỏ qua.
+//!   Nhà cung cấp tài nguyên sử dụng `fs::read` để truy cập file (theo sau các symlink), do đó một mục symlink
+//!   có thể làm rò rỉ các tệp trong container (như dữ liệu xác thực) vào webview. Phòng vệ zip-slip đơn thuần
+//!   là không đủ.
+//! - Chỉ các tệp thông thường và thư mục mới được giải nén; mọi loại mục khác (thiết bị, FIFO, tệp thưa sparse,
+//!   các phần mở rộng không xác định) đều là lỗi dừng ngay lập tức.
+//! - Đường dẫn các mục phải là đường dẫn chuẩn hóa tương đối nghiêm ngặt: không có đường dẫn tuyệt đối,
+//!   không có thành phần `..` hoặc `.`, không có tiền tố Windows. Mọi dạng khác đều bị từ chối trước khi
+//!   bất kỳ thao tác I/O nào diễn ra cho mục đó.
+//! - Giới hạn phòng chống zip-bomb: giới hạn số lượng tệp và giới hạn tổng số byte sau giải nén
+//!   (được kiểm tra đối chiếu dung lượng khai báo của từng mục *trước khi* đọc dữ liệu), kèm theo giới hạn
+//!   byte thô kéo qua bộ giải mã gzip — để cả siêu dữ liệu tar mà crate `tar` đệm nội bộ (ví dụ GNU long names)
+//!   cũng không thể phình to vô hạn.
+//! - Không bảo lưu các thuộc tính đặc biệt: các tệp được lưu với quyền mặc định, quyền sở hữu và mtime mặc định.
+//!   Tài nguyên web không cần đến những thuộc tính này.
+//! - Mỗi tệp được giải nén đều được chạy fsync. Một gói bundle bị rách nát sau khi mất điện đột ngột sẽ khiến
+//!   lần khởi động thử nghiệm thất bại và đưa vĩnh viễn một mã băm tệp nén *tốt* vào danh sách đen; tính bền vững
+//!   ở bước này chính là yếu tố giữ cho bản cập nhật đó tiếp tục phân phối thành công.
+//!
+//! ---
+//!
 //! Hardened tar.gz extraction for downloaded bundles.
 //!
 //! The archive is attacker-controlled until its sha256 matches the signed
@@ -32,22 +59,45 @@ use std::rc::Rc;
 
 use flate2::read::GzDecoder;
 
+/// Số lượng mục tối đa (tệp + thư mục) trong một tệp nén bundle.
+/// Bản phân phối web thông thường có dưới một nghìn mục; mức 10.000 tạo không gian rộng rãi
+/// trong khi vẫn ngăn chặn việc lạm dụng inode/dirent.
+///
+/// ---
+///
 /// Maximum number of entries (files + directories) in a bundle archive.
 /// A web dist is typically well under a thousand entries; 10k leaves room
 /// while bounding inode/dirent abuse.
 pub const MAX_FILES: usize = 10_000;
 
+/// Tổng số byte payload chưa nén tối đa trên tất cả các mục. Các bundle là bản dist frontend
+/// (vài MB khi nén); mức 500 MB chặn đứng các quả bom giải nén (decompression bomb) mà không bao giờ
+/// hạn chế một bản phát hành hợp lệ.
+///
+/// ---
+///
 /// Maximum total uncompressed payload bytes across all entries. Bundles are
 /// frontend dists (a few MB compressed); 500 MB bounds decompression bombs
 /// without ever constraining a legitimate release.
 pub const MAX_UNCOMPRESSED_BYTES: u64 = 500 * 1024 * 1024;
 
+/// Khoảng dung sai bổ sung trên [`MAX_UNCOMPRESSED_BYTES`] cho giới hạn luồng giải nén thô:
+/// chi phí đóng khung tar (tiêu đề 512-byte + padding cho mỗi mục, siêu dữ liệu tên dài).
+/// 32 MB đủ bao phủ vượt mức cho [`MAX_FILES`] mục.
+///
+/// ---
+///
 /// Slack on top of [`MAX_UNCOMPRESSED_BYTES`] for the raw decompressed
 /// stream cap: tar framing overhead (512-byte headers + padding per entry,
 /// long-name metadata). 32 MB covers [`MAX_FILES`] entries several times
 /// over.
 const STREAM_SLACK_BYTES: u64 = 32 * 1024 * 1024;
 
+/// Lý do việc giải nén bị từ chối hoặc thất bại. Mỗi biến thể đều là một điểm dừng nghiêm ngặt;
+/// bên gọi sẽ hủy bỏ thư mục đầu ra dở dang.
+///
+/// ---
+///
 /// Why extraction was refused or failed. Every variant is a hard stop; the
 /// caller discards the partial output directory.
 #[derive(Debug, thiserror::Error)]
@@ -67,6 +117,11 @@ pub enum ExtractError {
     TooLarge { limit: u64 },
 }
 
+/// Giải nén `archive` (tar.gz) vào thư mục `target` đã tồn tại,
+/// thực thi các giới hạn trong môi trường thực tế ([`MAX_FILES`], [`MAX_UNCOMPRESSED_BYTES`]).
+///
+/// ---
+///
 /// Extract `archive` (tar.gz) into the existing directory `target`,
 /// enforcing the production caps ([`MAX_FILES`], [`MAX_UNCOMPRESSED_BYTES`]).
 pub(crate) fn extract_tar_gz(archive: &Path, target: &Path) -> Result<(), ExtractError> {
@@ -77,6 +132,11 @@ pub(crate) fn extract_tar_gz(archive: &Path, target: &Path) -> Result<(), Extrac
     extract_with_limits(archive, target, limits)
 }
 
+/// Các giới hạn, được tách riêng khỏi các hằng số để các bài kiểm thử có thể thực thi logic kiểm tra
+/// với các giá trị nhỏ. Môi trường thực tế luôn luôn sử dụng các hằng số được tài liệu hóa.
+///
+/// ---
+///
 /// Caps, separated from the constants so tests can exercise the enforcement
 /// logic with small values. Production always uses the documented constants.
 #[derive(Debug, Clone, Copy)]

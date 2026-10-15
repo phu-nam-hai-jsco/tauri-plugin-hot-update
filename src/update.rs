@@ -1,3 +1,27 @@
+//! Quy trình tiếp nhận bản cập nhật: tải manifest → xác minh chữ ký
+//! → các cổng kiểm soát (gates) → tải gói nén (tính toán sha256 theo luồng dữ liệu) → giải nén an toàn →
+//! chuyển vào staged theo cơ chế nguyên tử. Đây là những gì các lệnh `check`/`download` của WP4 gọi đến.
+//!
+//! Thứ tự quy trình chính là chuỗi xác minh từ tài liệu thiết kế — mỗi bước
+//! chỉ tiêu thụ đầu ra *đã được xác minh* của bước trước đó, và mỗi cổng kiểm soát là một
+//! điểm dừng tuyệt đối (từ chối theo kiểu định danh hoặc trả về lỗi), không bao giờ cảnh-báo-rồi-chạy-tiếp:
+//!
+//! 1. tải các byte của manifest + tệp `.minisig` tách rời (có giới hạn dung lượng)
+//! 2. xác minh minisign dựa trên danh sách khóa tin cậy được nhúng (sẵn sàng cho việc xoay vòng khóa)
+//! 3. phân tích cú pháp + kiểm tra tính hợp lệ của JSON
+//! 4. các cổng kiểm soát đối chiếu với trạng thái đã lưu: `version > maxVersionSeen` (chống
+//!    phát lại bản hạ cấp), sha256 gói nén không nằm trong danh sách đen, `minShellVersion <= shell`
+//! 5. truyền luồng gói nén vào một tệp tạm dưới `bundles/`, tính toán mã băm trong quá trình tải;
+//!    kích thước chính xác + sha256 được kiểm tra bắt buộc trước khi bất kỳ thứ gì chạm vào các byte này
+//! 6. giải nén (an toàn) vào một thư mục tạm dưới `bundles/`
+//! 7. `allocate_seq` → đổi tên nguyên tử thành `bundles/seq-N/` → gọi `machine::stage`
+//!    thông qua `Store::update` (nơi sẽ kiểm tra lại các cổng — cẩn tắc vô ưu)
+//!
+//! Một sự cố crash ở bất kỳ đâu nhiều nhất chỉ để lại một tệp/thư mục tạm dưới `bundles/`,
+//! thứ mà GC ở lần khởi động sau sẽ dọn sạch. Có tính lũy đẳng: một phiên bản được cung cấp nếu đã
+//! ở trong staged hoặc đã commit sẽ được báo cáo lại như vậy, không tải lại lần nữa.
+//!
+//! ---
 //! The update-acquisition pipeline: manifest fetch → signature verification
 //! → gates → archive download (sha256 streamed) → hardened extraction →
 //! atomic staging. This is what WP4's `check`/`download` commands call.
@@ -34,21 +58,39 @@ use crate::manifest::{self, Manifest};
 use crate::runtime::HotUpdate;
 use crate::{Error, Result};
 
+/// Nơi cung cấp các bản cập nhật và ai được tin cậy để ký chúng. Hook khởi tạo
+/// của plugin xây dựng cấu trúc này từ [`crate::Config`] đã được xác thực; các bên gọi
+/// phía Rust có thể khởi tạo trực tiếp.
+///
+/// ---
 /// Where updates come from and who is trusted to sign them. The plugin
 /// setup hook builds this from the validated [`crate::Config`]; Rust-side
 /// callers may construct it directly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdateConfig {
+    /// URL của `manifest.json`. Chữ ký tách rời được tải từ
+    /// `{manifest_url}.minisig`, do đó URL phải là một URL tệp thông thường
+    /// (không có chuỗi truy vấn query strings).
+    ///
     /// URL of `manifest.json`. The detached signature is fetched from
     /// `{manifest_url}.minisig`, so the URL must be a plain file URL
     /// (no query strings).
     pub manifest_url: String,
+    /// Các khóa công khai minisign đáng tin cậy — dạng chuỗi base64 thô hoặc nội dung đầy đủ của `minisign.pub`.
+    /// Một manifest xác minh thành công với BẤT KỲ khóa nào cũng đều được tin cậy (xoay vòng:
+    /// cung cấp cả khóa cũ + mới trong giai đoạn chuyển đổi).
+    ///
     /// Trusted minisign public keys — raw base64 or full `minisign.pub`
     /// contents. A manifest verifying under ANY key is trusted (rotation:
     /// ship old + new during a transition).
     pub pubkeys: Vec<String>,
 }
 
+/// Kết quả của một lượt kiểm tra hoặc tải xuống. Việc từ chối là kết quả chuẩn mực,
+/// không phải lỗi: chúng là thông báo của quy trình nói rằng "manifest này không dành cho chúng ta",
+/// kèm theo lý do được lưu lại cho ứng dụng/UI.
+///
+/// ---
 /// Result of a check or download pass. Refusals are first-class outcomes,
 /// not errors: they are the pipeline saying "this manifest is not for us",
 /// with the reason preserved for the app/UI.
@@ -59,11 +101,20 @@ pub struct UpdateConfig {
     rename_all_fields = "camelCase"
 )]
 pub enum UpdateOutcome {
+    /// Chỉ dùng cho `check()`: một bản cập nhật đã xác minh, phù hợp đang được cung cấp.
+    ///
     /// `check()` only: a verified, applicable update is offered.
     Available { manifest: Manifest },
+    /// Chỉ dùng cho `check_and_download()`: đã tải xuống, xác minh, giải nén, đưa vào staged
+    /// cho lần khởi chạy nguội tiếp theo.
+    ///
     /// `check_and_download()` only: downloaded, verified, extracted, staged
     /// for the next cold launch.
     Staged { seq: u64, version: Version },
+    /// Phiên bản được cung cấp không mới hơn mốc watermark. Đây vừa là câu trả lời
+    /// "không có bản cập nhật" thông thường vừa là sự từ chối chống hạ cấp-phát lại —
+    /// một manifest cũ có chữ ký hợp lệ sẽ rơi vào trường hợp này.
+    ///
     /// The offered version is not strictly newer than the watermark. This is
     /// both the everyday "no update" answer and the downgrade-replay
     /// rejection — an old validly-signed manifest lands here.
@@ -71,18 +122,31 @@ pub enum UpdateOutcome {
         offered: Version,
         watermark: Version,
     },
+    /// Mã băm gói nén được cung cấp trước đây đã thất bại trong một lần khởi động thử và
+    /// vĩnh viễn nằm trong danh sách đen; một bản phát hành sửa lỗi sẽ mang mã băm mới.
+    ///
     /// The offered archive hash previously failed a trial boot and is
     /// permanently blacklisted; a fixed release ships under a new hash.
     Blacklisted { version: Version },
+    /// Gói yêu cầu phiên bản shell mới hơn; bản cài đặt này giữ nguyên vị trí cho đến khi
+    /// có bản cập nhật ứng dụng từ store.
+    ///
     /// The bundle requires a newer shell; this install stays put until a
     /// store update arrives.
     ShellTooOld { required: Version, shell: Version },
+    /// Chính xác gói nén này đã được đưa vào staged và đang chờ lần khởi động thử;
+    /// không cần làm gì thêm.
+    ///
     /// Exactly this archive is already staged and waiting for its trial
     /// boot; nothing to do.
     AlreadyStaged { seq: u64, version: Version },
 }
 
 impl HotUpdate {
+    /// Tải về và xác minh manifest, sau đó báo cáo xem nó có áp dụng được hay không.
+    /// Không bao giờ tải gói nén. Lỗi chỉ xảy ra khi xác minh/vận chuyển thất bại;
+    /// việc cổng kiểm soát từ chối vẫn là kết quả `Ok`.
+    ///
     /// Fetch and verify the manifest, then report whether it is applicable.
     /// Never downloads the archive. Errors are verification/transport
     /// failures; gate refusals are `Ok` outcomes.
@@ -100,6 +164,13 @@ impl HotUpdate {
         )
     }
 
+    /// Toàn bộ quy trình: kiểm tra, và nếu bản cập nhật phù hợp, tiến hành tải xuống,
+    /// xác minh, giải nén, và chuyển vào staged cho lần khởi động nguội tiếp theo.
+    ///
+    /// `on_progress(downloaded, total)` kích hoạt sau mỗi chunk gói nén nhận được.
+    /// Các lệnh gọi đồng thời được tuần tự hóa; bên bị trễ sẽ báo cáo
+    /// `AlreadyStaged`/`UpToDate` thay vì tải xuống hai lần.
+    ///
     /// The full pipeline: check, and if an update is applicable, download,
     /// verify, extract, and stage it for the next cold launch.
     ///
@@ -184,6 +255,9 @@ impl HotUpdate {
     }
 }
 
+/// Tải manifest + chữ ký tách rời, xác minh dựa trên các khóa tin cậy,
+/// phân tích cú pháp, xác thực tính hợp lệ. Không có gì ở hạ nguồn nhìn thấy các byte chưa được xác minh.
+///
 /// Fetch manifest + detached signature, verify against the trusted keys,
 /// parse, validate. Nothing downstream sees unverified bytes.
 async fn fetch_verified_manifest(
@@ -198,6 +272,11 @@ async fn fetch_verified_manifest(
     manifest::verify_and_parse(&manifest_bytes, &signature, &config.pubkeys)
 }
 
+/// Các cổng chấp nhận manifest, theo thứ tự ưu tiên từ chối. `None` nghĩa là
+/// manifest phù hợp. `machine::stage` sẽ kiểm tra lại mốc watermark và
+/// danh sách đen tại thời điểm chuyển vào staged — các cổng này đơn giản là từ chối sớm hơn, trước khi
+/// bất kỳ byte nào được tải về.
+///
 /// Manifest-accept gates, in refusal-precedence order. `None` means the
 /// manifest is applicable. `machine::stage` re-checks the watermark and
 /// blacklist at staging time — these gates simply refuse earlier, before

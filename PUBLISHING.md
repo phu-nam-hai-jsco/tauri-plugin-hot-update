@@ -1,5 +1,7 @@
 # Publishing checklist
 
+[English](PUBLISHING.md) | [Tiếng Việt](PUBLISHING.vi.md)
+
 The exact steps to take `tauri-plugin-hot-update` from this repo to crates.io,
 npm, and GitHub. Run them in order. Nothing here is automated — no CI publishes
 on push.

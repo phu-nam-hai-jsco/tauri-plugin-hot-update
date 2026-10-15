@@ -1,3 +1,26 @@
+//! Kho lưu trữ trên đĩa: lớp vỏ I/O mỏng bao quanh máy trạng thái thuần túy.
+//!
+//! Cấu trúc thư mục bên trong app data dir (tài liệu thiết kế, "On-disk layout"):
+//!
+//! ```text
+//! hot-update/
+//!   bundles/seq-<N>/    # mỗi thư mục chứa một gói đã giải nén
+//!   state.json          # machine::State được lưu bền vững
+//! ```
+//!
+//! Các quy tắc:
+//! - `state.json` được ghi theo cơ chế nguyên tử (tệp tạm trong cùng thư mục + fsync +
+//!   đổi tên), do đó sự cố crash giữa chừng khi ghi không bao giờ để lại một con trỏ ghi dở dang.
+//! - Một tệp `state.json` bị thiếu, bị cắt cụt hoặc không phân tích cú pháp được sẽ được nạp như một
+//!   [`State`] mới tinh — không bao giờ hoảng loạn/panic. Khi đó ứng dụng sẽ phục vụ gói nhúng
+//!   (mức sàn an toàn dự phòng) và máy trạng thái sẽ xây dựng lại trạng thái từ đó.
+//! - Mọi thứ bên dưới `bundles/` không phải là thư mục `seq-<N>` được tham chiếu đều là
+//!   rác do plugin sở hữu (các mục mồ côi do ứng dụng bị tắt ngang giữa lúc giải nén và ghi trạng thái,
+//!   thư mục tạm cũ) và sẽ được GC quét dọn khi khởi động.
+//! - Các seq được cấp phát cao hơn mọi seq từng thấy trên đĩa *hoặc* trong trạng thái,
+//!   vì vậy một thư mục mồ côi cũ không bao giờ trùng tên với một gói trong tương lai.
+//!
+//! ---
 //! On-disk store: the thin I/O shell around the pure state machine.
 //!
 //! Layout inside the app data dir (design doc, "On-disk layout"):
@@ -32,6 +55,11 @@ const STATE_FILE: &str = "state.json";
 const BUNDLES_DIR: &str = "bundles";
 const SEQ_PREFIX: &str = "seq-";
 
+/// Bộ xử lý trỏ tới thư mục `hot-update/`. Mọi biến đổi trạng thái đều đi qua
+/// [`Store::update`], giúp tuần tự hóa các chu kỳ nạp→chuyển đổi→lưu sau
+/// một mutex để lệnh xác nhận (ack) giữa phiên và một tiến trình tải xuống sắp xong không thể làm mất các bản cập nhật.
+///
+/// ---
 /// Handle to the `hot-update/` directory. All state mutations go through
 /// [`Store::update`], which serializes load→transition→persist cycles behind
 /// a mutex so a mid-session ack and a finishing download cannot lose updates.
@@ -42,6 +70,8 @@ pub struct Store {
 }
 
 impl Store {
+    /// `root` là chính thư mục `hot-update/` (được tạo lười khi cần).
+    ///
     /// `root` is the `hot-update/` directory itself (created lazily).
     pub fn new(root: PathBuf) -> Self {
         Self {
@@ -59,6 +89,10 @@ impl Store {
         self.root.join(STATE_FILE)
     }
 
+    /// Thư mục `bundles/`: nơi lưu trữ cuối cùng của `seq-<N>` và các tệp/thư mục
+    /// tạm thời của quy trình cập nhật (bất kỳ mục nào không phải `seq-<N>` ở đây
+    /// đều được GC quét sạch lúc khởi động, giúp các lần tải bị crash tự dọn dẹp).
+    ///
     /// The `bundles/` directory: final `seq-<N>` homes and the update
     /// pipeline's temp files/dirs (anything non-`seq-<N>` here is swept by
     /// boot GC, which is what makes crashed downloads self-cleaning).
@@ -66,11 +100,16 @@ impl Store {
         self.root.join(BUNDLES_DIR)
     }
 
+    /// Thư mục chứa một seq gói (`hot-update/bundles/seq-<N>`).
+    ///
     /// Directory a bundle seq lives in (`hot-update/bundles/seq-<N>`).
     pub fn bundle_dir(&self, seq: u64) -> PathBuf {
         self.bundles_dir().join(format!("{SEQ_PREFIX}{seq}"))
     }
 
+    /// Đọc nạp `state.json`. Các tệp bị thiếu hoặc bị hỏng sẽ trả về trạng thái mới tinh —
+    /// việc phục hồi là "phục vụ gói nhúng và làm lại từ đầu", không bao giờ hoảng loạn/panic.
+    ///
     /// Load `state.json`. Missing or corrupt files yield a fresh state —
     /// recovery is "serve embedded and start over", never a panic.
     pub fn load_state(&self) -> State {
@@ -97,6 +136,9 @@ impl Store {
         }
     }
 
+    /// Lưu trữ bền vững trạng thái theo cơ chế nguyên tử: ghi vào `state.json.tmp` trong cùng
+    /// thư mục, fsync, sau đó đổi tên ghi đè lên `state.json`.
+    ///
     /// Persist the state atomically: write `state.json.tmp` in the same
     /// directory, fsync, then rename over `state.json`.
     pub fn save_state(&self, state: &State) -> io::Result<()> {
@@ -112,6 +154,9 @@ impl Store {
         fs::rename(&tmp, &path)
     }
 
+    /// Tuần tự hóa quy trình nạp → chuyển đổi → lưu. Quá trình chuyển đổi chạy trên
+    /// trạng thái mới nhất trên đĩa và kết quả của nó được lưu trước khi trả về.
+    ///
     /// Serialized load → transition → persist. The transition runs on the
     /// freshest on-disk state and its result is persisted before returning.
     pub fn update<T>(&self, transition: impl FnOnce(State) -> (State, T)) -> io::Result<T> {
@@ -121,6 +166,8 @@ impl Store {
         Ok(out)
     }
 
+    /// Danh sách các seq của các thư mục `seq-<N>` đang tồn tại trong `bundles/`.
+    ///
     /// Seqs of the `seq-<N>` dirs that exist under `bundles/`.
     pub fn present_seqs(&self) -> BTreeSet<u64> {
         let Ok(entries) = fs::read_dir(self.bundles_dir()) else {
@@ -133,6 +180,9 @@ impl Store {
             .collect()
     }
 
+    /// Các mục bên dưới `bundles/` không phải là thư mục `seq-<N>` — các thư mục
+    /// tạm cũ và mảnh vụn rác còn sót lại từ các quá trình giải nén bị gián đoạn.
+    ///
     /// Entries under `bundles/` that are not `seq-<N>` dirs — stale temp
     /// dirs and other debris from interrupted extractions.
     pub fn foreign_entries(&self) -> Vec<PathBuf> {
@@ -149,6 +199,9 @@ impl Store {
             .collect()
     }
 
+    /// Seq tiếp theo: lớn hơn hẳn mọi thứ mà trạng thái tham chiếu và
+    /// mọi thứ hiện có trên đĩa, nhờ vậy các thư mục mồ côi không bao giờ bị trùng tên.
+    ///
     /// Next seq: strictly above everything the state references and
     /// everything present on disk, so orphan dirs are never aliased.
     pub fn allocate_seq(&self, state: &State) -> u64 {
@@ -167,6 +220,9 @@ impl Store {
         disk_max.max(state_max) + 1
     }
 
+    /// Thực thi các hiệu ứng xóa, theo nỗ lực tối đa (best-effort): việc xóa thất bại sẽ được ghi log
+    /// và để lại cho GC ở lần khởi động sau dọn dẹp.
+    ///
     /// Execute deletion effects, best-effort: a failed delete is logged and
     /// left for the next boot's GC.
     pub fn apply_effects(&self, effects: &[Effect]) {
@@ -177,6 +233,8 @@ impl Store {
         }
     }
 
+    /// Dọn sạch rác lạ (không phải `seq-<N>`) bên dưới `bundles/`.
+    ///
     /// Remove foreign (non-`seq-<N>`) debris under `bundles/`.
     pub fn sweep_foreign_entries(&self) {
         for path in self.foreign_entries() {

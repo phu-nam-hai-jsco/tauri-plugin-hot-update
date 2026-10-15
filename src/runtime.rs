@@ -1,3 +1,16 @@
+//! Kết nối lúc khởi động giữa máy trạng thái thuần túy và lớp vỏ I/O, cùng với
+//! API runtime trong tiến trình ([`HotUpdate`]).
+//!
+//! Đảm bảo về thứ tự thực thi (bất biến chống treo/hỏng): [`initialize`] chạy bên trong
+//! setup hook của plugin, vốn được tauri thực thi trong `Builder::build`
+//! (tauri 2.10.2 `app.rs:2289`; đã xác minh lại trên 2.11.5 `app.rs:2440`) —
+//! hoàn toàn trước khi bất kỳ cửa sổ hay webview nào được tạo ra, và do đó trước khi
+//! nhà cung cấp assets phục vụ dù chỉ một byte. Việc thăng cấp staged→booting
+//! được lưu bền vững bên trong [`initialize`], vì vậy khi việc phục vụ bắt đầu thì dấu hiệu rollback
+//! đã nằm sẵn trên đĩa. Nếu việc lưu thất bại, gói vừa được trang bị sẽ *không*
+//! được phục vụ (lần khởi động thử mà không có dấu hiệu lưu bền vững có thể lọt qua cơ chế rollback).
+//!
+//! ---
 //! Boot-time wiring between the pure state machine and the I/O shell, plus
 //! the in-process runtime API ([`HotUpdate`]).
 //!
@@ -152,6 +165,8 @@ pub(crate) fn initialize(shared: &Shared, root: PathBuf, embedded_version: Versi
     }
 }
 
+/// Nơi cung cấp frontend hiện đang được phục vụ.
+///
 /// Where the currently served frontend comes from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -160,16 +175,23 @@ pub enum BundleSource {
     Ota,
 }
 
+/// Ảnh chụp nhanh (snapshot) về những gì tiến trình này đang phục vụ.
+///
 /// Snapshot of what this process is serving.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CurrentBundle {
     pub source: BundleSource,
+    /// Seq của gói khi `source == Ota`.
+    ///
     /// Bundle seq when `source == Ota`.
     pub seq: Option<u64>,
     pub version: Version,
 }
 
+/// API Runtime, được quản lý trong trạng thái ứng dụng bởi [`crate::init`]. Các lệnh IPC
+/// (WP4) sẽ là các lớp bọc mỏng bên ngoài những phương thức này.
+///
 /// Runtime API, managed in the app state by [`crate::init`]. IPC commands
 /// (WP4) will be thin wrappers over these methods.
 pub struct HotUpdate {
@@ -177,6 +199,13 @@ pub struct HotUpdate {
 }
 
 impl HotUpdate {
+    /// Xác nhận commit gói mà tiến trình này đã khởi động (`notifyAppReady`).
+    ///
+    /// Commit seq đã khởi động trong bộ nhớ được ghi lại khi phân giải khởi động — không bao giờ
+    /// đọc lại giá trị từ đĩa — để một tiến trình tải xuống hoàn tất giữa phiên
+    /// vẫn ở trong trạng thái staged chờ lần khởi động thử nghiệm riêng của nó. Có tính lũy đẳng.
+    ///
+    /// ---
     /// Commit the bundle this process booted (`notifyAppReady`).
     ///
     /// Commits the in-memory booted seq captured at boot resolution — never
@@ -201,6 +230,8 @@ impl HotUpdate {
         Ok(outcome)
     }
 
+    /// Những gì đang được phục vụ ngay lúc này.
+    ///
     /// What is being served right now.
     pub fn current_bundle(&self) -> Result<CurrentBundle> {
         let activation = self.shared.activation()?;
@@ -218,6 +249,12 @@ impl HotUpdate {
         })
     }
 
+    /// Lối thoát khẩn cấp để debug/hỗ trợ: xóa toàn bộ trạng thái OTA và các gói bundle, khởi động lại
+    /// mốc watermark từ phiên bản nhúng. Thư mục gói hiện đang phục vụ
+    /// (nếu có) được giữ nguyên vị trí cho đến khi GC ở lần khởi động sau dọn dẹp để webview
+    /// đang chạy không bị rách giao diện; việc phục vụ sẽ quay về gói nhúng ở lần khởi chạy tiếp theo.
+    ///
+    /// ---
     /// Debug/support escape hatch: wipe all OTA state and bundles, restart
     /// the watermark from the embedded version. The currently served bundle
     /// dir (if any) is left in place until the next boot's GC so the running

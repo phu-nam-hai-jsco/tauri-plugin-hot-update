@@ -1,3 +1,22 @@
+//! `hot-update-sign` — tạo bản phát hành OTA đã ký từ một thư mục dist đã build:
+//! `bundle-<version>.tar.gz`, `manifest.json`, `manifest.json.minisig`.
+//!
+//! ```text
+//! hot-update-sign \
+//!   --dist path/to/dist \
+//!   --version 1.2.0 \
+//!   --min-shell 1.1.0 \
+//!   --key ~/.keys/hot-update.key \
+//!   --base-url https://cdn.example.com/ota \
+//!   --out release/
+//! ```
+//!
+//! Mật khẩu khóa bí mật minisign được đọc từ biến môi trường
+//! `HOT_UPDATE_KEY_PASSWORD` khi được thiết lập (dùng giá trị rỗng
+//! đối với các khóa không mã hóa trong CI); nếu không một lời nhắc tương tác sẽ yêu cầu
+//! nhập mật khẩu. Yêu cầu bật tính năng `cli`.
+//!
+//! ---
 //! `hot-update-sign` — produce a signed OTA release from a built dist dir:
 //! `bundle-<version>.tar.gz`, `manifest.json`, `manifest.json.minisig`.
 //!

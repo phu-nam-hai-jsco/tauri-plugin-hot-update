@@ -1,5 +1,7 @@
 # tauri-plugin-hot-update-api
 
+[English](README.md) | [Tiếng Việt](README.vi.md)
+
 TypeScript bindings for [`tauri-plugin-hot-update`](https://github.com/yanqianglu/tauri-plugin-hot-update)
 — hot update / OTA live updates (CodePush-style, self-hosted) for Tauri v2
 mobile and desktop apps. Ship frontend bundle updates to installed apps
